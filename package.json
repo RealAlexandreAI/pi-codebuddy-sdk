@@ -1,6 +1,6 @@
 {
   "name": "pi-codebuddy-sdk",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "CodeBuddy Agent SDK provider for Pi — native tool execution, 29+ models, thinking controls, session pool",
   "author": "slahser",
   "license": "MIT",
@@ -27,9 +27,15 @@
     "typebox": "*"
   },
   "peerDependenciesMeta": {
-    "@earendil-works/pi-ai": { "optional": true },
-    "@earendil-works/pi-coding-agent": { "optional": true },
-    "typebox": { "optional": true }
+    "@earendil-works/pi-ai": {
+      "optional": true
+    },
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "typebox": {
+      "optional": true
+    }
   },
   "pi": {
     "extensions": [
