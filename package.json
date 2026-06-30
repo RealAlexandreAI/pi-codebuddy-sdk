@@ -1,6 +1,6 @@
 {
   "name": "pi-codebuddy-sdk",
-  "version": "0.1.11",
+  "version": "0.1.12",
   "description": "CodeBuddy Agent SDK provider for Pi — native tool execution, 29+ models, thinking controls, session pool",
   "author": "slahser",
   "license": "MIT",
