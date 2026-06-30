@@ -83,18 +83,68 @@ function extractLatestUserText(context: Context): string {
   const messages = context.messages;
   for (let i = messages.length - 1; i >= 0; i--) {
     if (messages[i].role === "user") {
-      const content = (messages[i] as any).content;
-      if (typeof content === "string") return content;
-      if (Array.isArray(content)) {
-        const texts = content
-          .filter((c: any) => c?.type === "text")
-          .map((c: any) => c.text)
-          .join("\n");
-        if (texts) return texts;
-      }
+      let raw = extractRawContent((messages[i] as any).content);
+      if (!raw) continue;
+      // Strip context-mode session state injection prepended to user messages.
+      // Pi's context-mode adds its hierarchy/state before the actual user input.
+      raw = stripContextModeInjection(raw);
+      if (raw) return raw;
     }
   }
   return "Continue.";
+}
+
+function extractRawContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .filter((c: any) => c?.type === "text")
+    .map((c: any) => c.text)
+    .join("\n");
+}
+
+/**
+ * Pi context-mode prepends its session state to user messages.
+ * Strip it to keep CodeBuddy from treating it as conversation content.
+ *
+ * Injected format:
+ *   context-mode active. Hierarchy: ...
+ *   <session_state source="compaction">
+ *   <session_mode>investigate</session_mode>
+ *   </session_state>
+ *   [actual user message]
+ */
+function stripContextModeInjection(text: string): string {
+  // Find the end of context-mode injection
+  // Pattern: </session_state> followed by newlines then actual message
+  const sessionEnd = text.lastIndexOf("</session_state>");
+  if (sessionEnd >= 0) {
+    const after = text.slice(sessionEnd + "</session_state>".length).trimStart();
+    if (after) return after;
+  }
+
+  // Fallback: look for "context-mode active" header and take everything after it + session_state
+  const cmStart = text.indexOf("context-mode active.");
+  if (cmStart >= 0) {
+    // Find first blank line after </session_state> or end of XML
+    const afterSession = afterSessionState(text);
+    if (afterSession) return afterSession;
+  }
+
+  return text;
+}
+
+function afterSessionState(text: string): string | null {
+  // Try to find the actual user message after context-mode XML injection
+  const patterns = [
+    /context-mode active\.[\s\S]*?<\/session_state>\s*\n+([\s\S]+)$/,
+    /<session_state[\s\S]*?<\/session_state>\s*\n+([\s\S]+)$/,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    if (m?.[1]?.trim()) return m[1].trim();
+  }
+  return null;
 }
 
 // ── thinking config mapping ──
