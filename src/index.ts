@@ -54,7 +54,7 @@ async function discoverModels(): Promise<ProviderModelConfig[]> {
       ),
     ]);
     if (models && models.length > 0) {
-      let mapped = models.map((m) => {
+      return models.map((m) => {
         const caps = detectCapabilities(m.id);
         return {
           id: m.id,
@@ -66,15 +66,6 @@ async function discoverModels(): Promise<ProviderModelConfig[]> {
           maxTokens: caps.maxTokens,
         };
       });
-      // Sort Hunyuan first — this model is the fallback when quota is constrained.
-      // Pi auto-selects the first model, so this prevents "CLI process stdout closed"
-      // errors from models without token quota.
-      mapped.sort((a, b) => {
-        const aHy = a.id.includes('hy') || a.name.includes('Hunyuan') ? 0 : 1;
-        const bHy = b.id.includes('hy') || b.name.includes('Hunyuan') ? 0 : 1;
-        return aHy - bHy;
-      });
-      return mapped;
     }
   } catch (e) {
     // Discovery failed — SDK not installed, CLI missing, or network issue.
