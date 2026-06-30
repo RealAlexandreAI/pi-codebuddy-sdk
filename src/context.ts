@@ -73,11 +73,9 @@ function buildMessage(context: Context, startIndex: number): string | CbUserMess
 function buildHistoryPrefix(context: Context, startIndex: number): string {
   const parts: string[] = [];
 
-  // System prompt only on first turn (startIndex === 0)
-  if (startIndex === 0 && context.systemPrompt) {
-    parts.push(context.systemPrompt);
-    parts.push("");
-  }
+  // ponytail: skip Pi systemPrompt — CodeBuddy uses its own.
+  // Pi's prompt references MCP/tool ecosystem not present in CodeBuddy,
+  // which confuses the model into calling non-existent tools.
 
   const messages = context.messages;
 
