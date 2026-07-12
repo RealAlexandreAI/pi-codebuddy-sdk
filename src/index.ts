@@ -877,7 +877,18 @@ function processStreamEvent(
 	}
 
 	if (event?.type === "content_block_delta") {
-		const index = c.turnBlocks.findIndex((b: any) => b.index === event.index);
+		// Match the most-recently-started block at this content_block index.
+		// A later tool_use can reuse an index already held by an earlier
+		// block (seen in real streams); first-match lookup would append the
+		// later block's deltas onto the earlier one, concatenating two JSON
+		// payloads and silently dropping one tool's arguments. Reverse scan
+		// routes deltas to the active (last-started) block. (Stop events
+		// keep first-match: they run in start order and each deletes its
+		// index, so the next stop finds the correct block.)
+		let index = -1;
+		for (let i = c.turnBlocks.length - 1; i >= 0; i--) {
+			if (c.turnBlocks[i].index === event.index) { index = i; break; }
+		}
 		const block = c.turnBlocks[index];
 		if (!block) return;
 		if (event.delta?.type === "text_delta" && block.type === "text") {
