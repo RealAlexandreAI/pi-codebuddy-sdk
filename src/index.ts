@@ -1642,7 +1642,7 @@ async function ensureModelsDiscovered(): Promise<void> {
 	await discoverInFlight;
 }
 
-export default function (pi: ExtensionAPI) {
+export default async function (pi: ExtensionAPI) {
 	piApi = pi;
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
@@ -1657,9 +1657,12 @@ export default function (pi: ExtensionAPI) {
 	} else {
 		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides);
 	}
-	const registeredModels = MODELS;
 
-	discoverInFlight = discoverModels(pi);
+	// Discover real models BEFORE registering the provider, so the first
+	// (synchronous-flush) registration carries live models instead of the
+	// FALLBACK_MODELS snapshot. pi awaits this async factory before startup
+	// continues, so the model list shown at startup is never the fallback.
+	await ensureModelsDiscovered();
 
 	const clearSession = (event: string) => {
 		debug(`${event}: clearing session ${sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
@@ -1747,7 +1750,7 @@ export default function (pi: ExtensionAPI) {
 			baseUrl: PROVIDER_ID,
 			apiKey: "not-used",
 			api: "codebuddy-sdk",
-			models: registeredModels as any,
+			models: MODELS as any,
 			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
 			streamSimple: streamCodebuddySdk as any,
 		});
