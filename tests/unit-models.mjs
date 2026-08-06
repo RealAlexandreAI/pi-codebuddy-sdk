@@ -25,6 +25,40 @@ describe("buildModels", () => {
 		]));
 		assert.deepEqual(models.map((m) => m.id), ["model-b", "model-a"]);
 	});
+
+	it("applies global contextWindow/maxTokens overrides", () => {
+		const models = buildModels(
+			rawModelsFromSdk([{ value: "hy3-preview-agent-ioa", displayName: "H", description: "" }]),
+			{ contextWindow: 300_000, maxTokens: 32_768 },
+		);
+		assert.equal(models[0].contextWindow, 300_000);
+		assert.equal(models[0].maxTokens, 32_768);
+	});
+
+	it("applies per-model overrides and lets them beat globals", () => {
+		const models = buildModels(
+			rawModelsFromSdk([
+				{ value: "claude-sonnet", displayName: "Sonnet", description: "" },
+				{ value: "gpt-5", displayName: "GPT-5", description: "" },
+			]),
+			{ contextWindow: 200_000 },
+			{ "gpt-5": { contextWindow: 1_048_576, maxTokens: 64_000, reasoning: true, images: false } },
+		);
+		assert.equal(models[0].contextWindow, 200_000); // global applies
+		assert.equal(models[1].contextWindow, 1_048_576); // per-model wins
+		assert.equal(models[1].maxTokens, 64_000);
+		assert.equal(models[1].reasoning, true);
+		assert.deepEqual(models[1].input, ["text"]); // images=false
+	});
+
+	it("matches per-model override by substring (longest key wins)", () => {
+		const models = buildModels(
+			rawModelsFromSdk([{ value: "gpt-5-max", displayName: "M", description: "" }]),
+			undefined,
+			{ gpt: { maxTokens: 8_192 }, "gpt-5-max": { maxTokens: 128_000 } },
+		);
+		assert.equal(models[0].maxTokens, 128_000);
+	});
 });
 
 describe("codebuddyModelId", () => {

@@ -55,11 +55,49 @@ export const FALLBACK_MODELS: PiModel[] = [
 	{ id: "hy3-preview-agent-ioa", name: "Hunyuan 3 Preview", reasoning: true, input: ["text"], contextWindow: DEFAULT_CONTEXT, maxTokens: DEFAULT_MAX_TOKENS, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } },
 ];
 
-export function buildModels(models: PiModel[]): PiModel[] {
-	return models.map((m) => ({
-		...m,
-		cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-	}));
+export type ModelOverrides = {
+	contextWindow?: number;
+	maxTokens?: number;
+	reasoning?: boolean;
+	images?: boolean;
+};
+
+/**
+ * Apply config-driven overrides on top of the estimated model metadata.
+ * `globalOverrides` applies to every model; `perModel` is keyed by model id
+ * (matched by exact id first, then case-insensitive substring, longest key
+ * wins) and beats the global defaults.
+ */
+export function buildModels(
+	models: PiModel[],
+	globalOverrides?: ModelOverrides,
+	perModel?: Record<string, ModelOverrides>,
+): PiModel[] {
+	const sortedKeys = Object.keys(perModel ?? {}).sort((a, b) => b.length - a.length);
+	const match = (id: string): ModelOverrides | undefined => {
+		const lower = id.toLowerCase();
+		for (const key of sortedKeys) {
+			const k = key.toLowerCase();
+			if (id === key || (lower.includes(k) && k.length > 0)) return perModel![key];
+		}
+		return undefined;
+	};
+	return models.map((m) => {
+		const o = { ...globalOverrides, ...match(m.id) };
+		const contextWindow = o.contextWindow ?? m.contextWindow;
+		const maxTokens = o.maxTokens ?? m.maxTokens;
+		const input: ("text" | "image")[] = o.images === undefined
+			? m.input
+			: (o.images ? ["text", "image"] as const : ["text"] as const);
+		return {
+			...m,
+			contextWindow,
+			maxTokens,
+			reasoning: o.reasoning ?? m.reasoning,
+			input,
+			cost: m.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		};
+	});
 }
 
 export function codebuddyModelId(model: { id: string }): string {

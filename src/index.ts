@@ -124,6 +124,10 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 let MODELS: PiModel[] = buildModels(FALLBACK_MODELS);
 let providerSettings: NonNullable<Config["provider"]> = {};
 
+// Last-known-good model list, kept in a shared global so a module reload
+// during session resume can recover it when SDK discovery fails.
+const MODELS_CACHE_KEY = Symbol.for("codebuddy-sdk:modelsCache");
+
 type ContentBlockParam =
 	| { type: "text"; text: string }
 	| { type: "image"; source: { type: "base64"; media_type: string; data: string } };
@@ -1583,7 +1587,15 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			const supported = await q.supportedModels();
 			await q.return().catch(() => {});
 			if (!supported.length) return;
-			MODELS = buildModels(rawModelsFromSdk(supported as any));
+			MODELS = buildModels(
+				rawModelsFromSdk(supported as any),
+				providerSettings.modelOverrides ? undefined : providerSettings,
+				providerSettings.modelOverrides,
+			);
+			// Persist the successful discovery globally so a later session
+			// resume (module reload) can recover the real model list even if
+			// discovery fails that time (e.g. SDK subprocess gate is busy).
+			(globalThis as Record<symbol, any>)[MODELS_CACHE_KEY] = MODELS;
 			const g = globalThis as Record<symbol, any>;
 			const streamFn = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamCodebuddySdk;
 			pi.registerProvider(PROVIDER_ID, {
@@ -1597,7 +1609,29 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			modelsDiscovered = true;
 			debug(`discoverModels: registered ${MODELS.length} models from SDK`);
 		} catch (err) {
-			debug("discoverModels: failed, using fallback models", err);
+			// Resume/reload: discovery may fail (SDK subprocess gate busy,
+			// stale auth, transient CLI error). Recover the last known-good
+			// model list instead of collapsing to the single fallback model —
+			// otherwise the previously selected codebuddy model disappears
+			// from /model after `pi -r` and the user must re-pick it.
+			const cached = (globalThis as Record<symbol, any>)[MODELS_CACHE_KEY] as PiModel[] | undefined;
+			if (cached && cached.length) {
+				MODELS = cached;
+				debug(`discoverModels: failed, recovered ${MODELS.length} cached models`, err);
+				const g = globalThis as Record<symbol, any>;
+				const streamFn = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamCodebuddySdk;
+				pi.registerProvider(PROVIDER_ID, {
+					name: "CodeBuddy",
+					baseUrl: PROVIDER_ID,
+					apiKey: "not-used",
+					api: "codebuddy-sdk",
+					models: MODELS as any,
+					streamSimple: streamFn as any,
+				});
+				modelsDiscovered = true;
+			} else {
+				debug("discoverModels: failed, using fallback models", err);
+			}
 		}
 	});
 }
@@ -1613,6 +1647,15 @@ export default function (pi: ExtensionAPI) {
 	const config = loadConfig(process.cwd());
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
+	// Apply config overrides to the fallback models immediately, and recover
+	// a previously cached model list across module reloads (session resume).
+	const cached = (globalThis as Record<symbol, any>)[MODELS_CACHE_KEY] as PiModel[] | undefined;
+	if (cached && cached.length) {
+		MODELS = cached;
+		debug(`default: recovered ${MODELS.length} cached models from prior discovery`);
+	} else {
+		MODELS = buildModels(FALLBACK_MODELS, providerSettings, providerSettings.modelOverrides);
+	}
 	const registeredModels = MODELS;
 
 	discoverInFlight = discoverModels(pi);

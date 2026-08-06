@@ -27,6 +27,17 @@ export interface Config {
 		settingSources?: SettingSource[];
 		strictMcpConfig?: boolean;
 		pathToCodebuddyCode?: string;
+		/** Override the estimated context window (tokens) for ALL models. */
+		contextWindow?: number;
+		/** Override the estimated max output tokens for ALL models. */
+		maxTokens?: number;
+		/** Per-model overrides keyed by model id (or id substring). */
+		modelOverrides?: Record<string, {
+			contextWindow?: number;
+			maxTokens?: number;
+			reasoning?: boolean;
+			images?: boolean;
+		}>;
 	};
 }
 

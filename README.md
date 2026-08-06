@@ -102,6 +102,25 @@ File: `~/.pi/agent/codebuddy-sdk.json` or `.pi/codebuddy-sdk.json` in a project.
 | `provider.appendSystemPrompt` | `true` | Use Pi's system prompt instead of CodeBuddy's default identity |
 | `provider.strictMcpConfig` | `true` | Use only Pi-bridged MCP tools |
 | `provider.pathToCodebuddyCode` | auto | Path to `codebuddy` when it is **not** on `PATH` |
+| `provider.contextWindow` | estimated | Override context window (tokens) for **all** models (e.g. `300000`) |
+| `provider.maxTokens` | estimated | Override max output tokens for **all** models (e.g. `32768`) |
+| `provider.modelOverrides` | — | Per-model overrides, keyed by model id or substring (see below) |
+
+`modelOverrides` lets you fine-tune individual models; the longest matching
+key wins and beats the global `contextWindow` / `maxTokens`:
+
+```json
+{
+  "provider": {
+    "modelOverrides": {
+      "gpt-5": { "contextWindow": 1048576, "maxTokens": 64000, "images": false },
+      "claude": { "reasoning": true }
+    }
+  }
+}
+```
+
+Supported per-model keys: `contextWindow`, `maxTokens`, `reasoning`, `images`.
 
 ## Privacy
 
