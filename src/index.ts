@@ -10,6 +10,7 @@ import { homedir } from "os";
 import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
+import { readModelsCache, writeModelsCache } from "./models-cache.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
@@ -123,10 +124,6 @@ const SDK_TO_PI_TOOL_NAME: Record<string, string> = {
 
 let MODELS: PiModel[] = buildModels(FALLBACK_MODELS);
 let providerSettings: NonNullable<Config["provider"]> = {};
-
-// Last-known-good model list, kept in a shared global so a module reload
-// during session resume can recover it when SDK discovery fails.
-const MODELS_CACHE_KEY = Symbol.for("codebuddy-sdk:modelsCache");
 
 type ContentBlockParam =
 	| { type: "text"; text: string }
@@ -1595,7 +1592,10 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			// Persist the successful discovery globally so a later session
 			// resume (module reload) can recover the real model list even if
 			// discovery fails that time (e.g. SDK subprocess gate is busy).
-			(globalThis as Record<symbol, any>)[MODELS_CACHE_KEY] = MODELS;
+			// Written to disk so a NEW pi process (`pi -r` after exit) can also
+			// recover it synchronously at module load — the in-process global
+			// alone dies with the old process.
+			writeModelsCache(MODELS);
 			const g = globalThis as Record<symbol, any>;
 			const streamFn = g[ACTIVE_STREAM_SIMPLE_KEY] ?? streamCodebuddySdk;
 			pi.registerProvider(PROVIDER_ID, {
@@ -1614,7 +1614,7 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			// model list instead of collapsing to the single fallback model —
 			// otherwise the previously selected codebuddy model disappears
 			// from /model after `pi -r` and the user must re-pick it.
-			const cached = (globalThis as Record<symbol, any>)[MODELS_CACHE_KEY] as PiModel[] | undefined;
+			const cached = readModelsCache();
 			if (cached && cached.length) {
 				MODELS = cached;
 				debug(`discoverModels: failed, recovered ${MODELS.length} cached models`, err);
@@ -1648,8 +1648,9 @@ export default function (pi: ExtensionAPI) {
 	debug("loadConfig:", JSON.stringify(config));
 	providerSettings = config.provider ?? {};
 	// Apply config overrides to the fallback models immediately, and recover
-	// a previously cached model list across module reloads (session resume).
-	const cached = (globalThis as Record<symbol, any>)[MODELS_CACHE_KEY] as PiModel[] | undefined;
+	// a previously cached model list across module reloads (session resume)
+	// or across processes (`pi -r` after exit).
+	const cached = readModelsCache();
 	if (cached && cached.length) {
 		MODELS = cached;
 		debug(`default: recovered ${MODELS.length} cached models from prior discovery`);

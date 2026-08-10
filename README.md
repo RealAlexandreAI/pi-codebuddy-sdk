@@ -136,6 +136,12 @@ export CODEBUDDY_SDK_DEBUG=1
 
 Default log: `~/.pi/agent/codebuddy-sdk.log`. See [CONTRIBUTING.md](CONTRIBUTING.md) for maintainer details.
 
+**After `pi -r`, the previously selected codebuddy model is gone from `/model`?**
+The last-known-good model list is cached to `~/.pi/agent/codebuddy-sdk-models.json` on every
+successful discovery, so a new pi process can re-register it synchronously at module load —
+even when SDK discovery is still in flight (new process, gate busy, or stale auth). If the
+model is still missing, share the debug log (`CODEBUDDY_SDK_DEBUG=1`) and the cache file.
+
 ## Development
 
 Maintainers: [CONTRIBUTING.md](CONTRIBUTING.md).
