@@ -22,7 +22,12 @@ export function normalizeProjectPath(projectPath: string): string {
 }
 
 export function projectPathToHash(projectPath: string): string {
-	return normalizeProjectPath(projectPath).replace(/^\//, "").replace(/\//g, "-");
+	// Keep session paths aligned with CodeBuddy CLI PathUtils.compressPath.
+	return normalizeProjectPath(projectPath)
+		.replace(/[/\\:]/g, "-")
+		.replace(/^-+/, "")
+		.replace(/-+$/, "")
+		.replace(/-+/g, "-");
 }
 
 export function getProjectDir(projectPath: string, codebuddyDir?: string): string {
