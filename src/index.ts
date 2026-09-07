@@ -27,6 +27,16 @@ const newAssistantMessageEventStream: () => AssistantMessageEventStream =
 		? _piAi.createAssistantMessageEventStream
 		: () => new _piAi.AssistantMessageEventStream();
 
+// pi-ai ≥0.85 exports registerApiProvider. Registering "codebuddy-sdk" in
+// pi-ai's own apiProviderRegistry makes the api id dispatchable by pi-ai's
+// raw stream/streamSimple too — required for consumers that bypass the model
+// runtime (e.g. pi-observational-memory's background agents, which call
+// pi-agent-core agentLoop with pi-ai's raw streamSimple). pi.registerProvider
+// alone only routes registry-mediated streaming; raw dispatch would otherwise
+// throw "No API provider registered for api: codebuddy-sdk".
+const registerApiProviderFn: ((provider: { api: string; stream: any; streamSimple: any }, sourceId?: string) => void) | undefined =
+	typeof _piAi.registerApiProvider === "function" ? _piAi.registerApiProvider.bind(piAi) : undefined;
+
 // --- Debug logging ---
 // CODEBUDDY_SDK_DEBUG=1 enables local debug logs (metadata only; paths redacted; no prompt/tool bodies).
 
@@ -1754,6 +1764,28 @@ export default async function (pi: ExtensionAPI) {
 			// Cast: pi-ai AssistantMessageEventStream diamond dep between pi-coding-agent and pi-agent-core
 			streamSimple: streamCodebuddySdk as any,
 		});
+		// Also register in pi-ai's apiProviderRegistry so raw pi-ai
+		// stream/streamSimple dispatch works for api:"codebuddy-sdk" models
+		// (see registerApiProviderFn comment above). Idempotent (Map.set).
+		if (registerApiProviderFn) {
+			try {
+				registerApiProviderFn(
+					{
+						api: "codebuddy-sdk",
+						// The SDK bridge implements the streamSimple contract; raw
+						// stream() callers get the same event shape rather than a crash.
+						stream: streamCodebuddySdk as any,
+						streamSimple: streamCodebuddySdk as any,
+					},
+					"pi-codebuddy-sdk",
+				);
+				debug("provider: registered pi-ai API provider for api 'codebuddy-sdk'");
+			} catch (err) {
+				debug("provider: pi-ai API provider registration failed", err);
+			}
+		} else {
+			debug("provider: pi-ai registerApiProvider unavailable; raw streamSimple consumers cannot use codebuddy models");
+		}
 	} else {
 		// Subsequent instance (subagent session): skip registration entirely.
 		// The subagent already has access to codebuddy-sdk models via the shared
