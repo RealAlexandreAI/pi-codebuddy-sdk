@@ -11,6 +11,7 @@ import { dirname, join } from "path";
 import { PROVIDER_ID, messageContentToText, convertPiMessages } from "./convert.js";
 import { buildModels, codebuddyModelId, FALLBACK_MODELS, rawModelsFromSdk, resolveModel as _resolveModel, type PiModel } from "./models.js";
 import { readModelsCache, writeModelsCache } from "./models-cache.js";
+import { readTranscript } from "./transcript-compat.js";
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, buildCodebuddySystemPrompt } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
@@ -413,7 +414,8 @@ async function runIsolatedSummary(
 	};
 
 	try {
-		const promptText = extractIsolatedSummaryPrompt(context.messages);
+		const view = readTranscript(context);
+		const promptText = extractIsolatedSummaryPrompt(view.messages);
 		const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
 		const codebuddyExecutable = loadConfig(cwd).provider?.pathToCodebuddyCode;
 		const cliModel = codebuddyModelId(model);
@@ -428,7 +430,7 @@ async function runIsolatedSummary(
 				strictMcpConfig: true,
 				settingSources: [] as SettingSource[],
 				persistSession: false,
-				systemPrompt: context.systemPrompt,
+				systemPrompt: view.systemPrompt,
 				model: cliModel,
 				maxTurns: 1,
 				...(codebuddyExecutable ? { pathToCodebuddyCode: codebuddyExecutable } : {}),
@@ -772,7 +774,7 @@ function contextForToolResults(results: McpResult[]): QueryContext | undefined {
 	return undefined;
 }
 
-function resolveMcpTools(context: Context, excludeToolName?: string): {
+function resolveMcpTools(declaredTools: Tool[] | undefined, excludeToolName?: string): {
 	mcpTools: Tool[];
 	customToolNameToSdk: Map<string, string>;
 	customToolNameToPi: Map<string, string>;
@@ -781,9 +783,9 @@ function resolveMcpTools(context: Context, excludeToolName?: string): {
 	const customToolNameToSdk = new Map<string, string>();
 	const customToolNameToPi = new Map<string, string>();
 
-	if (!context.tools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
+	if (!declaredTools) return { mcpTools, customToolNameToSdk, customToolNameToPi };
 
-	for (const tool of context.tools) {
+	for (const tool of declaredTools) {
 		if (tool.name === excludeToolName) continue;
 		const sdkName = `${MCP_TOOL_PREFIX}${tool.name}`;
 		mcpTools.push(tool);
@@ -1187,8 +1189,12 @@ async function consumeQuery(
 function streamCodebuddySdk(model: Model<any>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream {
 	const stream = newAssistantMessageEventStream();
 
+	// Upstream #9548: pi-ai >= 0.85.2 passes a normalized transcript (prompt + tools carried by
+	// system messages). Read both shapes so this provider works before and after that change.
+	const { messages: convoMessages, systemPrompt: baseSystemPrompt, tools: declaredTools } = readTranscript(context);
+
 	// DEBUG: trace followUp message triggering
-	const lastMsgRole = context.messages[context.messages.length - 1]?.role;
+	const lastMsgRole = convoMessages[convoMessages.length - 1]?.role;
 	debug(`provider: streamCodebuddySdk called, activeQuery=${!!ctx().activeQuery}, lastMsgRole=${lastMsgRole}, isReentrant=${ctx().activeQuery !== null}`);
 
 	const activeQuery = ctx().activeQuery !== null;
@@ -1196,7 +1202,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const resultCtx = allResults.length > 0 ? contextForToolResults(allResults) : undefined;
 	const isReentrantUserQuery = activeQuery && lastMsgRole === "user" && allResults.length === 0;
 	if (isReentrantUserQuery) {
-		debug(`provider: active query user-only call treated as reentrant fresh query, waitingHandlers=${ctx().pendingToolCalls.size}, ctx.msgs=${context.messages.length}`);
+		debug(`provider: active query user-only call treated as reentrant fresh query, waitingHandlers=${ctx().pendingToolCalls.size}, ctx.msgs=${convoMessages.length}`);
 	}
 
 	// --- Tool result delivery ---
@@ -1206,7 +1212,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	if (resultCtx) {
 		claimCurrentPiStream(stream, "tool-result", resultCtx);
 		resultCtx.resetTurnState(model);
-		debug(`provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${context.messages.length}`);
+		debug(`provider: tool results, ${allResults.length} results, ${resultCtx.pendingToolCalls.size} waiting handlers, ctx.msgs=${convoMessages.length}`);
 		for (const result of allResults) {
 			const id = result.toolCallId;
 			if (id && resultCtx.pendingToolCalls.has(id)) {
@@ -1245,25 +1251,25 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 		// The bridge can't forward these mid-query (the SDK query is in progress),
 		// so we save them for replay as continuation queries after consumeQuery ends.
 		if (lastMsgRole === "user") {
-			const userPrompt = extractUserPrompt(context.messages);
+			const userPrompt = extractUserPrompt(convoMessages);
 			if (userPrompt) {
 				resultCtx.deferredUserMessages.push(userPrompt);
 				debug(`provider: deferred user message for replay after query (len=${userPrompt.length})`);
 			}
 		}
 
-		if (sharedSession) sharedSession.cursor = context.messages.length;
-		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, context.messages.length);
+		if (sharedSession) sharedSession.cursor = convoMessages.length;
+		resultCtx.latestCursor = Math.max(resultCtx.latestCursor, convoMessages.length);
 		return stream;
 	}
 
 	// --- Orphaned tool result (e.g. user aborted a tool call) ---
 	// The query is gone but pi still delivered the result. Nothing to do — just
 	// emit end_turn so pi waits for the next real user message.
-	const lastMsg = context.messages[context.messages.length - 1];
+	const lastMsg = convoMessages[convoMessages.length - 1];
 	if (lastMsg?.role === "toolResult") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		if (sharedSession) sharedSession.cursor = context.messages.length;
+		if (sharedSession) sharedSession.cursor = convoMessages.length;
 		const c = ctx();  // capture current context for the microtask
 		queueMicrotask(() => {
 			c.resetTurnState(model);
@@ -1291,24 +1297,24 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	queryCtx.resetTurnState(model);
 	queryCtx.latestCursor = 0;
 
-	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askCodebuddyToolName);
+	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(declaredTools, askCodebuddyToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id, Boolean(isReentrant));
+	const syncResult = syncSharedSession(convoMessages, cwd, customToolNameToSdk, model.id, Boolean(isReentrant));
 	const { sessionId: resumeSessionId } = syncResult;
-	const promptBlocks = extractUserPromptBlocks(context.messages);
-	let promptText = extractUserPrompt(context.messages) ?? "";
+	const promptBlocks = extractUserPromptBlocks(convoMessages);
+	let promptText = extractUserPrompt(convoMessages) ?? "";
 
 	// Guard: empty prompt means the last context message isn't a user message.
 	// This should never happen with per-query state — dump diagnostics if it does.
 	if (!promptText && !promptBlocks) {
 		diagDump("empty_prompt", {
-			contextLength: context.messages.length,
+			contextLength: convoMessages.length,
 			lastMsgRole: lastMsg?.role,
 			isReentrant,
 			activeQueryContexts: activeQueryContexts.size,
 			activeQueryExists: queryCtx.activeQuery !== null,
 			sharedSession: sharedSession ? { sessionId: sharedSession.sessionId.slice(0, 8), cursor: sharedSession.cursor } : null,
-			messageRoles: context.messages.map((m, i) => `[${i}]${m.role}`).join(" "),
+			messageRoles: convoMessages.map((m, i) => `[${i}]${m.role}`).join(" "),
 		});
 		// Recover: use a continuation prompt so the SDK doesn't send an empty text block
 		promptText = "[continue]";
@@ -1320,7 +1326,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	const mcpServers = buildMcpServers(mcpTools, queryCtx);
 	const appendSystemPrompt = providerSettings.appendSystemPrompt !== false;
 	const systemPrompt = appendSystemPrompt
-		? buildCodebuddySystemPrompt(context.systemPrompt)
+		? buildCodebuddySystemPrompt(baseSystemPrompt)
 		: undefined;
 
 	// MCP auto-loading suppression: CC reads MCP servers from ~/.claude.json (top-level
@@ -1366,7 +1372,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 	};
 
 	debug("provider: fresh query",
-		`model=${cliModel} msgs=${context.messages.length} tools=${mcpTools.length}`,
+		`model=${cliModel} msgs=${convoMessages.length} tools=${mcpTools.length}`,
 		`resume=${resumeSessionId?.slice(0, 8) ?? "none"} effort=${effort ?? "default"}`,
 		`appendSys=${appendSystemPrompt} strictMcp=${strictMcpConfigEnabled}`,
 		`promptLen=${promptText.length}${promptBlocks ? " [+images]" : ""}`);
@@ -1426,7 +1432,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				}
 				debug(`provider: query done, ignoring captured session ${capturedSessionId?.slice(0, 8) ?? "none"} to preserve shared session`);
 			} else if (sessionId) {
-				const cursor = Math.max(context.messages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
+				const cursor = Math.max(convoMessages.length, queryCtx.latestCursor, sharedSession?.cursor ?? 0);
 				debug(`provider: query done, session=${sessionId.slice(0, 8)}, cursor=${cursor}`);
 				sharedSession = { sessionId, cursor, cwd };
 			}
