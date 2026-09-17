@@ -100,6 +100,76 @@ function diagDump(label: string, data: Record<string, unknown>) {
 	debug(`DIAG: ${label} (see ${redactForLog(DIAG_LOG_PATH)})`);
 }
 
+// --- SDK transport teardown guard (issue #10) ---
+//
+// @tencent-ai/agent-sdk dispatches late `control_request`/`mcp_message` frames
+// fire-and-forget: `handleLine()` calls `this.handleMcpMessageRequest(req)`
+// without awaiting or catching it. When the CLI subprocess has just been torn
+// down (interrupt → retry), the response path throws
+// `Error: Transport not started` from `writeLine()` inside an *unowned* async
+// function → unhandledRejection → the host escalates it to `fatal` and exits.
+//
+// Upstream still ships the unguarded call as of 0.3.259, so we patch the
+// transport prototype once per process: errors from a half-dead transport are
+// undeliverable anyway and must be swallowed, not crash the session.
+const patchedTransportPrototypes = new WeakSet<object>();
+
+function noteTransportTeardown(where: string, err: unknown): void {
+	debug(`transport guard: swallowed ${where} failure during teardown: ${err instanceof Error ? err.message : String(err)}`);
+	diagDump("transport_teardown_swallowed", {
+		where,
+		message: err instanceof Error ? err.message : String(err),
+		stack: err instanceof Error ? err.stack?.split("\n").slice(0, 6).join(" | ") ?? null : null,
+	});
+}
+
+function installTransportTeardownGuard(sdkQuery: unknown): void {
+	const transport = (sdkQuery as { transport?: unknown } | null | undefined)?.transport;
+	if (!transport || typeof transport !== "object") return;
+	const proto = Object.getPrototypeOf(transport) as Record<string, unknown> | null;
+	if (!proto || patchedTransportPrototypes.has(proto)) return;
+
+	const originalHandle = proto.handleMcpMessageRequest;
+	if (typeof originalHandle === "function") {
+		proto.handleMcpMessageRequest = function (this: unknown, request: unknown) {
+			try {
+				return Promise.resolve(originalHandle.call(this, request)).catch((err: unknown) => {
+					noteTransportTeardown("handleMcpMessageRequest", err);
+				});
+			} catch (err) {
+				// Synchronous throw before a promise exists — same teardown class.
+				noteTransportTeardown("handleMcpMessageRequest(sync)", err);
+				return undefined;
+			}
+		};
+	}
+
+	const originalSendError = proto.sendControlErrorResponse;
+	if (typeof originalSendError === "function") {
+		proto.sendControlErrorResponse = function (this: unknown, requestId: unknown, error: unknown) {
+			try {
+				return (originalSendError as (...a: unknown[]) => unknown).call(this, requestId, error);
+			} catch (err) {
+				noteTransportTeardown("sendControlErrorResponse", err);
+			}
+		};
+	}
+
+	patchedTransportPrototypes.add(proto);
+	debug("transport guard: installed on SDK ProcessTransport prototype");
+}
+
+/** Create an SDK query and immediately arm the transport teardown guard. */
+function startQuery(args: Parameters<typeof query>[0]): ReturnType<typeof query> {
+	const q = query(args);
+	try {
+		installTransportTeardownGuard(q);
+	} catch (err) {
+		debug(`transport guard: install failed: ${err instanceof Error ? err.message : String(err)}`);
+	}
+	return q;
+}
+
 // --- Constants ---
 
 // Global key to prevent re-registration of the provider across module reloads.
@@ -349,7 +419,7 @@ async function runIsolatedSummary(
 		const cliModel = codebuddyModelId(model);
 		debug(`compact summary: spawn model=${cliModel} registeredModel=${model.id} promptLen=${promptText.length}`);
 
-		sdkQuery = query({
+		sdkQuery = startQuery({
 			prompt: promptText,
 			options: {
 				cwd,
@@ -524,6 +594,7 @@ function syncSharedSession(
 	cwd: string,
 	customToolNameToSdk?: Map<string, string>,
 	modelId?: string,
+	isReentrant?: boolean,
 ): SyncResult {
 	const priorMessages = messages.slice(0, -1); // everything before the new user prompt
 
@@ -548,13 +619,37 @@ function syncSharedSession(
 		}
 	}
 	// Only reachable when needsRebuild is false — user-facing history rewrites
-	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
-	// sharedSession before the next syncSharedSession call. In practice this
-	// fires only for isolated compact-summary subprocesses.
+	// (/compact, session_tree, /new, fork) usually set needsRebuild or clear
+	// sharedSession before the next syncSharedSession call. The remaining case is
+	// a pi-side history rewrite that did NOT flag us: a branch summary after an
+	// interrupted turn (a retry whose abort never reached the provider), which
+	// makes pi's visible history shorter than our cursor.
 	if (sharedSession && !sharedSession.needsRebuild && priorMessages.length < sharedSession.cursor) {
-		debug(`Case 1 synthetic: clean start for shorter context, preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
-		debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
-		return { sessionId: null, preserveSharedSession: true };
+		// Top-level call with real history left: falling through to a clean start
+		// would send only the final user message with no `resume`, so the model
+		// answers as if the conversation never happened (issue #10). Rewrite the
+		// shared session from the truncated history instead — the turn keeps
+		// whatever context pi still has. forceRotate avoids racing a CLI
+		// subprocess that may still be writing to the old session file.
+		if (priorMessages.length > 0 && !isReentrant) {
+			const dropped = sharedSession.cursor - priorMessages.length;
+			const sessionId = sharedSession.sessionId;
+			debug(`Case 1 synthetic: history shrank by ${dropped} (${priorMessages.length} < cursor ${sharedSession.cursor}) — rebuilding shared session ${sessionId.slice(0, 8)} instead of clean start`);
+			piUI?.notify(
+				`CodeBuddy SDK: conversation history shrank by ${dropped} message(s) — rebuilding session context instead of starting fresh (see ${ISSUES_URL}#issue-comments if the reply still lacks context)`,
+				"warning",
+			);
+			diagDump("history_shrank_rebuild", { dropped, priorMessages: priorMessages.length, cursor: sharedSession.cursor, sessionId });
+			sharedSession = { ...sharedSession, needsRebuild: true, forceRotate: true };
+			// fall through to REBUILD below
+		} else {
+			// No prior history (isolated compact-summary prompt) or a reentrant
+			// subagent call: nothing to rebuild from, or rewriting would clobber
+			// the parent's shared session. Keep the ephemeral clean start.
+			debug(`Case 1 synthetic: clean start for shorter context (prior=${priorMessages.length}, reentrant=${Boolean(isReentrant)}), preserving shared session ${sharedSession.sessionId.slice(0, 8)}, cursor=${sharedSession.cursor}`);
+			debug(`syncResult: path=clean-start preserve-shared sessionId=${sharedSession.sessionId} cursor=${sharedSession.cursor}`);
+			return { sessionId: null, preserveSharedSession: true };
+		}
 	}
 
 	// REBUILD path
@@ -1130,8 +1225,15 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 			}
 		}
 		if (resultCtx.pendingToolCalls.size > 0) {
-			debug(`WARNING: ${resultCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
-			piUI?.notify(`CodeBuddy SDK: ${resultCtx.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck`, "warning");
+		debug(`WARNING: ${resultCtx.pendingToolCalls.size} MCP handlers still waiting after delivering ${allResults.length} results`);
+		// The wedged turn cannot be unwedged in place: retrying tears down the
+		// CLI subprocess while its control pipe is still alive (issue #10). Exit
+		// and resume the session instead — the local transcript is intact.
+		piUI?.notify(
+			`CodeBuddy SDK: ${resultCtx.pendingToolCalls.size} tool handler(s) still waiting — provider may be stuck. ` +
+			`Prefer exiting and resuming this session over retrying in place, or the reply may lose context.`,
+			"warning",
+		);
 		}
 
 		// Detect user messages (steer/followUp) that pi injected into context
@@ -1191,7 +1293,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 
 	const { mcpTools, customToolNameToSdk, customToolNameToPi } = resolveMcpTools(context, askCodebuddyToolName);
 	const cwd = (options as { cwd?: string } | undefined)?.cwd ?? process.cwd();
-	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id);
+	const syncResult = syncSharedSession(context.messages, cwd, customToolNameToSdk, model.id, Boolean(isReentrant));
 	const { sessionId: resumeSessionId } = syncResult;
 	const promptBlocks = extractUserPromptBlocks(context.messages);
 	let promptText = extractUserPrompt(context.messages) ?? "";
@@ -1292,7 +1394,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 
 	void (async () => {
 		await ensureModelsDiscovered();
-		sdkQuery = query({ prompt, options: queryOptions });
+		sdkQuery = startQuery({ prompt, options: queryOptions });
 		queryCtx.activeQuery = sdkQuery;
 		activeQueryContexts.add(queryCtx);
 
@@ -1341,7 +1443,7 @@ function streamCodebuddySdk(model: Model<any>, context: Context, options?: Simpl
 				}
 
 				const contOptions = { ...queryOptions, resume: resumeId, ...makeCliDebugOptions("continuation") };
-				const contQuery = query({ prompt: steerPrompt, options: contOptions });
+				const contQuery = startQuery({ prompt: steerPrompt, options: contOptions });
 				queryCtx.activeQuery = contQuery;
 				debug(`provider: continuation query, model=${cliModel}, resume=${resumeId.slice(0, 8)}, promptLen=${steerPrompt.length}`);
 
@@ -1468,7 +1570,7 @@ async function promptAndWait(
 		`isolated=${options?.isolated ?? false} resume=${resumeSessionId?.slice(0, 8) ?? "none"}`,
 		`sysPrompt=${Boolean(askSystemPrompt)} promptLen=${prompt.length}`);
 
-	const sdkQuery = query({
+	const sdkQuery = startQuery({
 		prompt,
 		options: {
 			cwd,
@@ -1580,7 +1682,7 @@ let discoverInFlight: Promise<void> | null = null;
 async function discoverModels(pi: ExtensionAPI): Promise<void> {
 	await withSdkGate(async () => {
 		try {
-			const q = query({ prompt: " ", options: { maxTurns: 0, permissionMode: "bypassPermissions", tools: [] } });
+			const q = startQuery({ prompt: " ", options: { maxTurns: 0, permissionMode: "bypassPermissions", tools: [] } });
 			const supported = await q.supportedModels();
 			await q.return().catch(() => {});
 			if (!supported.length) return;
