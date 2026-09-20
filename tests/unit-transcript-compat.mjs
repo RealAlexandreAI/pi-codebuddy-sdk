@@ -52,11 +52,14 @@ describe("readTranscript", () => {
 		);
 	});
 
-	it("returns undefined prompt/tools for a transcript without system messages", () => {
+	it("returns no prompt/tools for a transcript without system messages", () => {
 		const context = { messages: [{ role: "user", content: "hi" }] };
 		const view = readTranscript(context);
 		assert.equal(view.systemPrompt, undefined);
-		assert.equal(view.tools, undefined);
+		// pi-ai >= 0.86.0 exports the transcript helpers, which report an empty tool list
+		// instead of undefined. Both shapes mean "no declarations"; downstream only cares
+		// about emptiness.
+		assert.ok(view.tools === undefined || view.tools.length === 0);
 		assert.deepEqual(view.messages, [{ role: "user", content: "hi" }]);
 	});
 });
