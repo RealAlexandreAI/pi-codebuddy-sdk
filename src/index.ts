@@ -20,6 +20,7 @@ import { loadConfig, type Config } from "./config.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
 import { buildActionSummary, type ToolCallState } from "./askcodebuddy-ui.js";
 import { withSdkGate } from "./sdk-gate.js";
+import { closeQueryTransport, endQuery } from "./query-teardown.js";
 
 // Compat (#2): use factory if available (pi-ai ≥0.66), else fall back to constructor (gsd-pi etc.)
 const _piAi = piAi as any;
@@ -496,7 +497,7 @@ async function runIsolatedSummary(
 		stream.end();
 	} finally {
 		options?.signal?.removeEventListener("abort", onAbort);
-		try { sdkQuery?.interrupt(); } catch {}
+		endQuery(sdkQuery, "compact-summary", { log: debug });
 	}
 }
 
@@ -1667,7 +1668,7 @@ async function promptAndWait(
 		return { responseText, stopReason };
 	} finally {
 		signal?.removeEventListener("abort", onAbort);
-		void sdkQuery.interrupt().catch(() => {});
+		endQuery(sdkQuery, "askCodebuddy", { log: debug });
 	}
 }
 
@@ -1687,8 +1688,9 @@ let discoverInFlight: Promise<void> | null = null;
 
 async function discoverModels(pi: ExtensionAPI): Promise<void> {
 	await withSdkGate(async () => {
+		let q: ReturnType<typeof startQuery> | undefined;
 		try {
-			const q = startQuery({ prompt: " ", options: { maxTurns: 0, permissionMode: "bypassPermissions", tools: [] } });
+			q = startQuery({ prompt: " ", options: { maxTurns: 0, permissionMode: "bypassPermissions", tools: [] } });
 			const supported = await q.supportedModels();
 			await q.return().catch(() => {});
 			if (!supported.length) return;
@@ -1740,6 +1742,12 @@ async function discoverModels(pi: ExtensionAPI): Promise<void> {
 			} else {
 				debug("discoverModels: failed, using fallback models", err);
 			}
+		} finally {
+			// supportedModels() never iterates the query, so the SDK's cleanup()
+			// (the only place the transport is closed) never runs here — close it
+			// explicitly or the codebuddy-headless child leaks for the host's
+			// lifetime. Idempotent, so a completed iterator is a harmless no-op.
+			if (q) closeQueryTransport(q, "discoverModels", { log: debug });
 		}
 	});
 }
